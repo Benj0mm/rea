@@ -584,6 +584,42 @@ const namedCertificate = (issuer: Buffer, subject: Buffer) =>
     der(0x03, Buffer.from([0])),
   );
 
+it.each(["signature", "public-key", "issuer-id", "subject-id"] as const)(
+  "validates BIT STRING padding for %s at the shared certificate boundary",
+  (field) => {
+    const name = directoryName(der(0x0c, Buffer.from("Fixture")));
+    const certificate = (content: number[]) =>
+      readAsn1(
+        derSeq(
+          derSeq(
+            derInt(1),
+            SHA256_ALG,
+            name,
+            validity,
+            name,
+            field === "public-key"
+              ? derSeq(SHA256_ALG, der(0x03, Buffer.from(content)))
+              : spki,
+            ...(field === "issuer-id" ? [der(0x81, Buffer.from(content))] : []),
+            ...(field === "subject-id"
+              ? [der(0x82, Buffer.from(content))]
+              : []),
+          ),
+          SHA256_ALG,
+          der(0x03, Buffer.from(field === "signature" ? content : [0])),
+        ),
+      );
+    for (const invalid of [[1], [7], [1, 1], [7, 0x81]])
+      expect(() => parseCertificate(certificate(invalid))).toThrow(
+        PeCertificateAsn1Failure,
+      );
+    for (const valid of [[0], [0, 0xff], [1, 0xfe], [7, 0x80]])
+      expect(parseCertificate(certificate(valid)).subject.text).toBe(
+        "commonName=Fixture",
+      );
+  },
+);
+
 it("rejects a certificate missing subjectPublicKeyInfo or signatureValue", () => {
   const issuer = directoryName(der(0x0c, Buffer.from("A")));
   const subject = directoryName(der(0x0c, Buffer.from("B")));
@@ -793,3 +829,85 @@ it("preserves valid BMPString code units on both sides of the surrogate range", 
     parseCertificate(readAsn1(namedCertificate(name, name))).subject.text,
   ).toBe("commonName=\ud7ff\ue000\ufeff");
 });
+
+it.each([
+  [
+    "PrintableString",
+    0x13,
+    [
+      "name@host",
+      "under_score",
+      "A\u0000B",
+      "A\tB",
+      "A\n",
+      "A\r",
+      "A\u007f",
+      "é",
+      "中",
+    ],
+  ],
+  ["IA5String", 0x16, ["é", "中"]],
+] as const)(
+  "rejects characters outside the %s alphabet in certificate names",
+  (_label, tag, values) => {
+    for (const value of values) {
+      const invalid = directoryName(der(tag, Buffer.from(value, "utf8")));
+      const valid = directoryName(der(0x0c, Buffer.from(value, "utf8")));
+      for (const [issuer, subject] of [
+        [invalid, valid],
+        [valid, invalid],
+      ] as const) {
+        expect(() =>
+          parseCertificate(readAsn1(namedCertificate(issuer, subject))),
+        ).toThrow(PeCertificateAsn1Failure);
+      }
+      const certificate = parseCertificate(
+        readAsn1(namedCertificate(valid, valid)),
+      );
+      expect(certificate.issuer.attributes[0]?.value).toBe(value);
+      expect(certificate.subject.attributes[0]?.value).toBe(value);
+    }
+  },
+);
+
+it("bounds IA5String inspection before alphabet validation and charges text once", () => {
+  const ascii = Buffer.alloc(Math.floor(MAX_DECODED_NAME_BYTES / 3), 0x41);
+  const within = directoryName(der(0x16, ascii));
+  const certificate = parseCertificate(
+    readAsn1(namedCertificate(within, within)),
+  );
+  expect(certificate.issuer.attributes[0]?.value).toBe(ascii.toString("ascii"));
+  expect(certificate.subject.attributes[0]?.value).toBe(
+    ascii.toString("ascii"),
+  );
+  for (const ending of [Buffer.from("A"), Buffer.from("é")]) {
+    const oversized = Buffer.concat([
+      Buffer.alloc(MAX_DECODED_NAME_BYTES, 0x41),
+      ending,
+    ]);
+    const parseOversized = () =>
+      parseCertificate(
+        readAsn1(namedCertificate(directoryName(der(0x16, oversized)), within)),
+      );
+    expect(parseOversized).toThrow(
+      expect.objectContaining({
+        exhausted: { allowance: "decoded-text", limit: MAX_DECODED_NAME_BYTES },
+      }),
+    );
+  }
+});
+
+it.each([
+  [0x13, "AZaz09 '()+,-./:=?"],
+  [0x16, "mail_box@example.test\u0000\t\u007f"],
+] as const)(
+  "preserves valid character boundaries for name tag %i",
+  (tag, value) => {
+    const name = directoryName(der(tag, Buffer.from(value, "ascii")));
+    const certificate = parseCertificate(
+      readAsn1(namedCertificate(name, name)),
+    );
+    expect(certificate.issuer.attributes[0]?.value).toBe(value);
+    expect(certificate.subject.attributes[0]?.value).toBe(value);
+  },
+);

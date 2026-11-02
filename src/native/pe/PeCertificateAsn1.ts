@@ -186,9 +186,19 @@ const decodeDirectoryString = (
       return decodeUtf32Be(node.content, budget);
     case 0x1e:
       return decodeBmpString(node.content, budget);
-    case 0x0c:
-    case 0x13:
+    case 0x13: {
+      const decoded = decodeUtf8(node.content, budget);
+      if (/[^A-Za-z0-9 '()+,\-./:=?]/u.test(decoded))
+        return fail("PrintableString holds a character outside its alphabet.");
+      return decoded;
+    }
     case 0x16:
+      chargeDecodedName(budget, node.content.length);
+      if (node.content.some((byte) => byte > 0x7f))
+        return fail("IA5String holds a non-ASCII character.");
+      // Validated ASCII needs no UTF-8 round trip or second budget charge.
+      return node.content.toString("ascii");
+    case 0x0c:
     case 0x17:
     case 0x18:
       return decodeUtf8(node.content, budget);
@@ -222,6 +232,11 @@ const requireBitStringContent = (content: Buffer, label: string): void => {
   const unused = content[0];
   if (unused === undefined || unused > 7)
     return fail(`${label} BIT STRING is truncated or has invalid unused bits.`);
+  if (
+    (content.length === 1 && unused !== 0) ||
+    ((content[content.length - 1] ?? 0) & ((1 << unused) - 1)) !== 0
+  )
+    return fail(`${label} BIT STRING has invalid padding bits.`);
 };
 
 const requireBitString = (
